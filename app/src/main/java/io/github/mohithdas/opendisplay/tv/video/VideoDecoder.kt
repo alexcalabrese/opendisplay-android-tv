@@ -69,10 +69,17 @@ class VideoDecoder(
         try {
             drainOutput(activeCodec)
             val now = android.os.SystemClock.elapsedRealtime()
-            if (progress.isStalled(now)) {
-                Log.warn("decoder stalled with ${progress.pendingFrames} pending frames; requesting a keyframe")
-                signalError()
-                return
+            when (progress.recoveryAction(now)) {
+                DecoderRecoveryAction.REQUEST_KEYFRAME -> {
+                    Log.warn("decoder output delayed with ${progress.pendingFrames} pending frames; requesting keyframe without restart")
+                    requestKeyframe()
+                }
+                DecoderRecoveryAction.RESTART -> {
+                    Log.warn("decoder did not recover after keyframe request; rebuilding with ${progress.pendingFrames} pending frames")
+                    signalError()
+                    return
+                }
+                DecoderRecoveryAction.NONE -> Unit
             }
             if (now - lastStatsAt >= 1000) {
                 Log.info("decoder totals: queued=$queuedFrames rendered=$renderedFrames dropped=$droppedFrames")
