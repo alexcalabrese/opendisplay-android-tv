@@ -1,6 +1,5 @@
 package io.github.mohithdas.opendisplay.tv.ui
 
-import android.graphics.PorterDuff
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -24,8 +23,17 @@ import androidx.compose.ui.viewinterop.AndroidView
 import io.github.mohithdas.opendisplay.tv.net.PhoneReceiver
 import io.github.mohithdas.opendisplay.tv.util.Log
 import io.github.mohithdas.opendisplay.tv.video.VideoDecoder
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 
 private const val TOUCH_SLOP_PX = 24f
 
@@ -48,10 +56,13 @@ fun VideoSurface(
     onVideoDimsChanged: (VideoDims) -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    val decoderDispatcher = remember {
+        Executors.newSingleThreadExecutor { task -> Thread(task, "OpenDisplayDecoder") }.asCoroutineDispatcher()
+    }
+    val decoderScope = remember { CoroutineScope(SupervisorJob() + decoderDispatcher) }
     var decoder by remember { mutableStateOf<VideoDecoder?>(null) }
     val currentReceiver by rememberUpdatedState(receiver)
     val currentDims by rememberUpdatedState(videoDims)
-    val currentConnected by rememberUpdatedState(connected)
     val onDimsChanged by rememberUpdatedState(onVideoDimsChanged)
     val selection by receiver.displaySelection.collectAsState()
     val previousConnection = remember { AtomicBoolean(false) }
@@ -61,12 +72,26 @@ fun VideoSurface(
     // collector survives surface create/destroy cycles.
     LaunchedEffect(receiver) {
         receiver.videoFrames.collect { frame ->
-            if (VideoDisconnectPolicy.shouldSubmitFrame(currentConnected)) decoder?.submit(frame)
+            withContext(decoderDispatcher) {
+                if (VideoDisconnectPolicy.shouldSubmitFrame(receiver.connected.value)) decoder?.submit(frame)
+            }
+        }
+    }
+
+    LaunchedEffect(decoder) {
+        val activeDecoder = decoder ?: return@LaunchedEffect
+        while (isActive) {
+            withContext(decoderDispatcher) {
+                if (decoder === activeDecoder && receiver.connected.value) activeDecoder.drain()
+            }
+            delay(10)
         }
     }
 
     LaunchedEffect(selection) {
-        decoder?.updateExpectedSize(selection.pixels.width, selection.pixels.height)
+        withContext(decoderDispatcher) {
+            decoder?.updateExpectedSize(selection.pixels.width, selection.pixels.height)
+        }
     }
 
     AndroidView(
@@ -96,18 +121,18 @@ fun VideoSurface(
                     override fun surfaceDestroyed(holder: SurfaceHolder) {
                         Log.info("SurfaceView destroyed — releasing decoder")
                         keepScreenOn = false
-                        decoder?.release()
+                        val oldDecoder = decoder
                         decoder = null
+                        decoderScope.launch { oldDecoder?.release() }
                     }
                 })
             }
         },
         update = { surface ->
             val wasConnected = previousConnection.getAndSet(connected)
-            if (VideoDisconnectPolicy.shouldClearRetainedFrame(wasConnected, connected)) {
-                Log.info("peer disconnected — resetting decoder and clearing retained frame")
-                decoder?.reset()
-                surface.clearRetainedFrame()
+            if (VideoDisconnectPolicy.shouldResetDecoder(wasConnected, connected)) {
+                Log.info("peer disconnected — resetting decoder")
+                decoderScope.launch { decoder?.reset() }
             }
             // The window flag implements the user policy. The SurfaceView additionally keeps
             // the display awake only while a live decoder stream is attached.
@@ -116,23 +141,15 @@ fun VideoSurface(
     )
 
     DisposableEffect(Unit) {
-        onDispose { decoder?.release() }
-    }
-}
-
-private fun SurfaceView.clearRetainedFrame() {
-    if (!holder.surface.isValid) return
-    try {
-        val canvas = holder.lockCanvas()
-        try {
-            canvas.drawColor(android.graphics.Color.BLACK, PorterDuff.Mode.SRC)
-        } finally {
-            holder.unlockCanvasAndPost(canvas)
+        onDispose {
+            val oldDecoder = decoder
+            decoder = null
+            decoderScope.launch {
+                oldDecoder?.release()
+                decoderDispatcher.close()
+                decoderScope.cancel()
+            }
         }
-    } catch (error: Exception) {
-        // Some vendor Surface implementations briefly reject Canvas access while MediaCodec
-        // detaches. ReceiverScreen's opaque disconnect scrim is the visual fallback.
-        Log.warn("could not clear retained video surface; using disconnect scrim", error)
     }
 }
 

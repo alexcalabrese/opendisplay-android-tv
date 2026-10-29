@@ -178,7 +178,6 @@ class PhoneReceiver(
 
     private val _videoFrames = MutableSharedFlow<VideoFrame>(
         extraBufferCapacity = 2,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST,
     )
     val videoFrames: SharedFlow<VideoFrame> = _videoFrames.asSharedFlow()
 
@@ -387,10 +386,13 @@ class PhoneReceiver(
     }
 
     private fun acceptConnection(client: Socket) {
+        val previousHost = socket?.inetAddress
         val previousAddress = socket?.remoteSocketAddress?.toString()
         val newAddress = client.remoteSocketAddress?.toString()
         closeConnection()
-        if (previousAddress != null && newAddress != null && previousAddress != newAddress) {
+        _peerSignal.value = null
+        if (PeerReplacementPolicy.shouldWarn(previousHost, client.inetAddress) &&
+            previousAddress != null && newAddress != null) {
             _peerSignal.value = PeerSignal.PeerReplaced(previousAddress, newAddress)
         }
         client.tcpNoDelay = true
@@ -402,7 +404,7 @@ class PhoneReceiver(
         readJob = scope.launch { readLoop(client) }
     }
 
-    private fun readLoop(client: Socket) {
+    private suspend fun readLoop(client: Socket) {
         val frameDecoder = Framing.FrameDecoder()
         val input = client.getInputStream()
         val buffer = ByteArray(READ_BUFFER_SIZE)
@@ -418,7 +420,7 @@ class PhoneReceiver(
                     Log.error("invalid frame from peer; dropping connection", error)
                     break
                 }
-                frames.forEach(::dispatchFrame)
+                for (frame in frames) dispatchFrame(frame)
             }
         } catch (error: IOException) {
             if (running.get()) Log.info("receive error: ${error.message}")
@@ -456,7 +458,7 @@ class PhoneReceiver(
         }
     }
 
-    private fun dispatchFrame(frame: ByteArray) {
+    private suspend fun dispatchFrame(frame: ByteArray) {
         if (AnnexB.isControlJson(frame)) {
             handleControlJson(frame)
             return
@@ -464,7 +466,7 @@ class PhoneReceiver(
         val parsed = AnnexB.parse(frame)
         if (parsed.vclNalus.isEmpty() && parsed.sps == null && parsed.pps == null) return
         val telemetry = AnnexB.parseTelemetry(parsed.telemetryPrefix)
-        _videoFrames.tryEmit(
+        _videoFrames.emit(
             VideoFrame(parsed.sps, parsed.pps, parsed.vclNalus, telemetry.captureMs, telemetry.sendMs),
         )
         recordPerfSample(telemetry.captureMs)

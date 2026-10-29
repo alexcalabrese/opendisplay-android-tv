@@ -1,6 +1,7 @@
 package io.github.mohithdas.opendisplay.tv.video
 
 import android.media.MediaCodec
+import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Build
 import android.view.Surface
@@ -45,6 +46,43 @@ class VideoDecoder(
     private var currentPps: ByteArray? = null
     private var lastErrorSignalAt = 0L
     private val bufferInfo = MediaCodec.BufferInfo()
+    private var queuedFrames = 0L
+    private var renderedFrames = 0L
+    private var droppedFrames = 0L
+    private var lastStatsAt = 0L
+    private var waitingForKeyframe = true
+    private val progress = DecoderProgress()
+
+    private fun requestKeyframe() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastErrorSignalAt >= 1000) {
+            lastErrorSignalAt = now
+            onError()
+        }
+    }
+
+    fun drain() {
+        val activeCodec = codec ?: run {
+            requestKeyframe()
+            return
+        }
+        try {
+            drainOutput(activeCodec)
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (progress.isStalled(now)) {
+                Log.warn("decoder stalled with ${progress.pendingFrames} pending frames; requesting a keyframe")
+                signalError()
+                return
+            }
+            if (now - lastStatsAt >= 1000) {
+                Log.info("decoder totals: queued=$queuedFrames rendered=$renderedFrames dropped=$droppedFrames")
+                lastStatsAt = now
+            }
+        } catch (error: Exception) {
+            Log.error("decoder output failed", error)
+            signalError()
+        }
+    }
 
     /** Update the seed size (e.g. after a rotation) before the next SPS/PPS
      * change triggers a reconfigure. Does not itself force a reconfigure —
@@ -68,9 +106,22 @@ class VideoDecoder(
                 headersChanged = true
             }
         }
-        if (headersChanged) reconfigure()
+        if (headersChanged) {
+            release()
+            waitingForKeyframe = true
+        }
         if (frame.vclNalus.isEmpty()) return
-        val mediaCodec = codec ?: return // no SPS/PPS yet — nothing to feed until the first keyframe
+        val isKeyframe = frame.vclNalus.any { (it[0].toInt() and 0x1f) == 5 }
+        if (waitingForKeyframe && !isKeyframe) {
+            requestKeyframe()
+            return
+        }
+        if (codec == null) reconfigure()
+        val mediaCodec = codec ?: run {
+            requestKeyframe()
+            return
+        }
+        waitingForKeyframe = false
         queueAccessUnit(mediaCodec, frame.vclNalus)
     }
 
@@ -82,16 +133,20 @@ class VideoDecoder(
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, expectedWidth, expectedHeight)
             format.setByteBuffer("csd-0", ByteBuffer.wrap(START_CODE + sps))
             format.setByteBuffer("csd-1", ByteBuffer.wrap(START_CODE + pps))
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val mediaCodec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+            codec = mediaCodec // Own it before configure/start so failure cleanup releases it.
+            val supportsLowLatency = Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                mediaCodec.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+                    .isFeatureSupported(MediaCodecInfo.CodecCapabilities.FEATURE_LowLatency)
+            Log.info("decoder ${mediaCodec.name}, low-latency supported=$supportsLowLatency")
+            if (supportsLowLatency) {
                 format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             }
             format.setInteger(MediaFormat.KEY_PRIORITY, 0) // realtime
 
-            val mediaCodec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             mediaCodec.configure(format, surface, null, 0)
             mediaCodec.start()
-            codec = mediaCodec
-            Log.info("MediaCodec configured, seed ${expectedWidth}x$expectedHeight")
+            Log.info("MediaCodec ${mediaCodec.name} configured, seed ${expectedWidth}x$expectedHeight")
         } catch (e: Exception) {
             Log.error("MediaCodec configure failed", e)
             signalError()
@@ -100,12 +155,20 @@ class VideoDecoder(
 
     private fun queueAccessUnit(mediaCodec: MediaCodec, nalus: List<ByteArray>) {
         try {
-            // Non-blocking dequeue: low latency means "latest frame wins" —
-            // if the codec is momentarily busy, drop rather than wait,
-            // mirroring the Mac encoder's own pendingEncodes backpressure.
-            val index = mediaCodec.dequeueInputBuffer(0)
-            if (index < 0) return
-            val inputBuffer = mediaCodec.getInputBuffer(index) ?: return
+            drainOutput(mediaCodec)
+            var index = mediaCodec.dequeueInputBuffer(0)
+            val deadline = android.os.SystemClock.elapsedRealtime() + 100
+            while (index < 0 && android.os.SystemClock.elapsedRealtime() < deadline) {
+                drainOutput(mediaCodec)
+                index = mediaCodec.dequeueInputBuffer(5000)
+            }
+            if (index < 0) {
+                droppedFrames++
+                Log.warn("decoder input stalled; requesting a fresh keyframe")
+                signalError()
+                return
+            }
+            val inputBuffer = checkNotNull(mediaCodec.getInputBuffer(index)) { "Codec returned no input buffer" }
             inputBuffer.clear()
             var size = 0
             for (nalu in nalus) {
@@ -114,6 +177,8 @@ class VideoDecoder(
                 size += START_CODE.size + nalu.size
             }
             mediaCodec.queueInputBuffer(index, 0, size, System.nanoTime() / 1000, 0)
+            queuedFrames++
+            progress.queued(android.os.SystemClock.elapsedRealtime())
             drainOutput(mediaCodec)
         } catch (e: Exception) {
             Log.error("decode failed — rebuilding on the next keyframe", e)
@@ -130,22 +195,27 @@ class VideoDecoder(
         release()
         currentSps = null
         currentPps = null
-        val now = System.currentTimeMillis()
-        if (now - lastErrorSignalAt > 1000) {
-            lastErrorSignalAt = now
-            onError()
-        }
+        waitingForKeyframe = true
+        requestKeyframe()
     }
 
     private fun drainOutput(mediaCodec: MediaCodec) {
         while (true) {
             val outIndex = mediaCodec.dequeueOutputBuffer(bufferInfo, 0)
             when {
-                outIndex >= 0 -> mediaCodec.releaseOutputBuffer(outIndex, true) // render ASAP
+                outIndex >= 0 -> {
+                    mediaCodec.releaseOutputBuffer(outIndex, true)
+                    renderedFrames++
+                    progress.rendered(android.os.SystemClock.elapsedRealtime())
+                }
                 outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                     val format = mediaCodec.outputFormat
-                    val width = format.getInteger(MediaFormat.KEY_WIDTH)
-                    val height = format.getInteger(MediaFormat.KEY_HEIGHT)
+                    val width = if (format.containsKey("crop-right") && format.containsKey("crop-left")) {
+                        format.getInteger("crop-right") - format.getInteger("crop-left") + 1
+                    } else format.getInteger(MediaFormat.KEY_WIDTH)
+                    val height = if (format.containsKey("crop-bottom") && format.containsKey("crop-top")) {
+                        format.getInteger("crop-bottom") - format.getInteger("crop-top") + 1
+                    } else format.getInteger(MediaFormat.KEY_HEIGHT)
                     Log.info("decoder output format changed: ${width}x$height")
                     onSizeChanged(width, height)
                 }
@@ -166,10 +236,12 @@ class VideoDecoder(
             }
         }
         codec = null
+        progress.reset()
     }
 
     /** Releases decoder resources and forgets stream headers after a peer disconnects. */
     fun reset() {
+        waitingForKeyframe = true
         release()
         currentSps = null
         currentPps = null

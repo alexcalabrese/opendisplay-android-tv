@@ -39,6 +39,13 @@ android {
     }
 
     buildTypes {
+        debug {
+            if (providers.gradleProperty("devBuild").orNull == "true") {
+                applicationIdSuffix = ".dev"
+                versionNameSuffix = "-dev"
+                resValue("string", "app_name", "OpenDisplay TV Dev")
+            }
+        }
         release {
             isMinifyEnabled = false
             if (keystorePropertiesFile.exists()) {
@@ -55,6 +62,7 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+        resValues = true
     }
 
     lint {

@@ -49,3 +49,8 @@ internal object NsdRegistrationPolicy {
     fun canRegister(running: Boolean, activeListenerPort: Int?, requestedPort: Int): Boolean =
         running && activeListenerPort == requestedPort
 }
+
+internal object PeerReplacementPolicy {
+    fun shouldWarn(previousHost: InetAddress?, newHost: InetAddress): Boolean =
+        previousHost != null && previousHost != newHost
+}

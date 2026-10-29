@@ -46,4 +46,10 @@ signing/
 
 # Personal ADB installation helpers stay local.
 /install.sh
-/scripts/
+/scripts/*
+!/scripts/test-tv.sh
+
+# Local TV diagnostic captures
+diagnostics/
+
+.kotlin/

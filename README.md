@@ -92,7 +92,7 @@ Quit and reopen OpenDisplay again after deleting the values.
 
 ## TV settings
 
-Every control has an Android TV focus outline and works with a D-pad and OK button. **Settings** remains visible while disconnected and fades out after five seconds of connected inactivity. Any remote-key, touch, mouse, or air-mouse interaction reveals it again; D-pad/OK focuses it, while Menu/Settings opens the dialog directly. Back closes settings first; leaving the Activity does not accidentally stop the foreground receiver. Disconnecting clears the retained video frame and returns to an opaque black listener screen.
+Every control has an Android TV focus outline and works with a D-pad and OK button. **Settings** remains visible while disconnected and fades out after five seconds of connected inactivity. Any remote-key, touch, mouse, or air-mouse interaction reveals it again; D-pad/OK focuses it, while Menu/Settings opens the dialog directly. Back closes settings first; leaving the Activity does not accidentally stop the foreground receiver. Disconnecting releases the decoder and covers the video surface with an opaque black listener screen.
 
 ### Resolution and UI scale
 
@@ -183,6 +183,8 @@ cd opendisplay-android-tv
 ./gradlew testDebugUnitTest lintDebug assembleDebug
 ./gradlew connectedDebugAndroidTest  # with an API 30+ Android TV emulator running
 ```
+
+For a development APK that installs alongside the official app, use `./gradlew -PdevBuild=true assembleDebug`. It uses the package suffix `.dev` and the name **OpenDisplay TV Dev**. With an authorized TV available over ADB, run `./scripts/test-tv.sh TV_IP:PORT` to build, install, launch, and capture logs. The script stops the official receiver to avoid discovery conflicts and saves logs under `diagnostics/`. It uses ADB server port 5038; override with `TV_ADB_SERVER_PORT` if needed.
 
 The debug APK is under `app/build/outputs/apk/debug/`. Release signing uses an ignored `keystore.properties` file pointing to a protected keystore outside the repository. CI restores the same PKCS#12 key from encrypted GitHub Actions secrets, signs the APK, verifies it with `apksigner`, and publishes `OpenDisplay-TV.apk` plus `OpenDisplay-TV.apk.sha256`. No keystore or signing password belongs in Git.
 

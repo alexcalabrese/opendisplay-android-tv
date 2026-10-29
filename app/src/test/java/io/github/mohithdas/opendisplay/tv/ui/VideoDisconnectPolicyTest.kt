@@ -6,11 +6,11 @@ import org.junit.Test
 
 class VideoDisconnectPolicyTest {
     @Test
-    fun retainedFrameIsClearedOnlyOnDisconnectTransition() {
-        assertFalse(VideoDisconnectPolicy.shouldClearRetainedFrame(false, false))
-        assertFalse(VideoDisconnectPolicy.shouldClearRetainedFrame(false, true))
-        assertFalse(VideoDisconnectPolicy.shouldClearRetainedFrame(true, true))
-        assertTrue(VideoDisconnectPolicy.shouldClearRetainedFrame(true, false))
+    fun decoderIsResetOnlyOnDisconnectTransition() {
+        assertFalse(VideoDisconnectPolicy.shouldResetDecoder(false, false))
+        assertFalse(VideoDisconnectPolicy.shouldResetDecoder(false, true))
+        assertFalse(VideoDisconnectPolicy.shouldResetDecoder(true, true))
+        assertTrue(VideoDisconnectPolicy.shouldResetDecoder(true, false))
     }
 
     @Test
